@@ -27,17 +27,41 @@ Parameters:
     Type: String
     Default: python3.6
 Resources:
+  MyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: test-role-123
+      AssumeRolePolicyDocument: {}
   MyFunc:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: %s
       Handler: index.handler
+      Role: !GetAtt 'MyRole.Arn'
       Runtime:
         Ref: LambdaRuntime
       InlineCode: |
         def handler(event, context):
             return {'hello': 'world'}
 """
+TEST_TEMPLATE_5 = """
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  S3Setup:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: test-%s
+""" % short_uid()
+TEST_ARTIFACTS_BUCKET = 'cf-artifacts'
+TEST_ARTIFACTS_PATH = 'stack.yaml'
+TEST_TEMPLATE_6 = """
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  NestedStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: http://localhost:4572/%s/%s
+""" % (TEST_ARTIFACTS_BUCKET, TEST_ARTIFACTS_PATH)
 
 
 def bucket_exists(name):
@@ -51,10 +75,13 @@ def bucket_exists(name):
 def queue_exists(name):
     sqs_client = aws_stack.connect_to_service('sqs')
     queues = sqs_client.list_queues()
-    url = name if '://' in name else aws_stack.get_sqs_queue_url(name)
+    try:
+        url = name if '://' in name else aws_stack.get_sqs_queue_url(name)
+    except Exception:
+        return False
     for queue_url in queues['QueueUrls']:
         if queue_url == url:
-            return True
+            return queue_url
 
 
 def topic_exists(name):
@@ -114,10 +141,12 @@ def get_topic_arns():
 
 class CloudFormationTest(unittest.TestCase):
 
-    def test_apply_template(self):
+    def test_create_delete_stack(self):
         cloudformation = aws_stack.connect_to_resource('cloudformation')
+        cf_client = aws_stack.connect_to_service('cloudformation')
         s3 = aws_stack.connect_to_service('s3')
         sns = aws_stack.connect_to_service('sns')
+        sqs = aws_stack.connect_to_service('sqs')
         apigateway = aws_stack.connect_to_service('apigateway')
         template = template_deployer.template_to_json(load_file(TEST_TEMPLATE_1))
 
@@ -132,26 +161,38 @@ class CloudFormationTest(unittest.TestCase):
 
         retry(check_stack, retries=3, sleep=2)
 
-        # assert that bucket has been created
+        # assert that resources have been created
         assert bucket_exists('cf-test-bucket-1')
-        # assert that queue has been created
-        assert queue_exists('cf-test-queue-1')
-        # assert that topic has been created
-        assert topic_exists('%s-test-topic-1-1' % stack_name)
-        # assert that stream has been created
+        queue_url = queue_exists('cf-test-queue-1')
+        assert queue_url
+        topic_arn = topic_exists('%s-test-topic-1-1' % stack_name)
+        assert topic_arn
         assert stream_exists('cf-test-stream-1')
-        # assert that queue has been created
         resource = describe_stack_resource(stack_name, 'SQSQueueNoNameProperty')
         assert queue_exists(resource['PhysicalResourceId'])
 
-        # assert that topic tags have been created
+        # assert that tags have been created
         tags = s3.get_bucket_tagging(Bucket='cf-test-bucket-1')['TagSet']
         self.assertEqual(tags, [{'Key': 'foobar', 'Value': aws_stack.get_sqs_queue_url('cf-test-queue-1')}])
+        tags = sns.list_tags_for_resource(ResourceArn=topic_arn)['Tags']
+        self.assertEqual(tags, [
+            {'Key': 'foo', 'Value': 'cf-test-bucket-1'},
+            {'Key': 'bar', 'Value': aws_stack.s3_bucket_arn('cf-test-bucket-1')}
+        ])
+        queue_tags = sqs.list_queue_tags(QueueUrl=queue_url)
+        self.assertIn('Tags', queue_tags)
+        self.assertEqual(queue_tags['Tags'], {'key1': 'value1', 'key2': 'value2'})
+
         # assert that subscriptions have been created
         subs = sns.list_subscriptions()['Subscriptions']
         subs = [s for s in subs if (':%s:cf-test-queue-1' % TEST_AWS_ACCOUNT_ID) in s['Endpoint']]
         self.assertEqual(len(subs), 1)
         self.assertIn(':%s:%s-test-topic-1-1' % (TEST_AWS_ACCOUNT_ID, stack_name), subs[0]['TopicArn'])
+        # assert that subscription attributes are added properly
+        attrs = sns.get_subscription_attributes(SubscriptionArn=subs[0]['SubscriptionArn'])['Attributes']
+        self.assertEqual(attrs, {'Endpoint': subs[0]['Endpoint'], 'Protocol': 'sqs',
+            'SubscriptionArn': subs[0]['SubscriptionArn'], 'TopicArn': subs[0]['TopicArn'],
+            'FilterPolicy': json.dumps({'eventType': ['created']})})
 
         # assert that Gateway responses have been created
         test_api_name = 'test-api'
@@ -160,6 +201,15 @@ class CloudFormationTest(unittest.TestCase):
         self.assertEqual(len(responses), 2)
         types = [r['responseType'] for r in responses]
         self.assertEqual(set(types), set(['UNAUTHORIZED', 'DEFAULT_5XX']))
+
+        # delete the stack
+        cf_client.delete_stack(StackName=stack_name)
+
+        # assert that resources have been deleted
+        assert not bucket_exists('cf-test-bucket-1')
+        assert not queue_exists('cf-test-queue-1')
+        assert not topic_exists('%s-test-topic-1-1' % stack_name)
+        retry(lambda: self.assertFalse(stream_exists('cf-test-stream-1')))
 
     def test_list_stack_events(self):
         cloudformation = aws_stack.connect_to_service('cloudformation')
@@ -193,8 +243,9 @@ class CloudFormationTest(unittest.TestCase):
         def check_stack():
             stack = get_stack_details(stack_name)
             self.assertEqual(stack['StackStatus'], 'CREATE_COMPLETE')
+            return stack
 
-        retry(check_stack, retries=3, sleep=2)
+        details = retry(check_stack, retries=3, sleep=2)
 
         stack_summaries = list_stack_resources(stack_name)
         queue_urls = get_queue_urls()
@@ -207,6 +258,11 @@ class CloudFormationTest(unittest.TestCase):
         stack_topics = [r for r in stack_summaries if r['ResourceType'] == 'AWS::SNS::Topic']
         for resource in stack_topics:
             self.assertIn(resource['PhysicalResourceId'], topic_arns)
+
+        # assert that stack outputs are returned properly
+        outputs = details.get('Outputs', [])
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]['ExportName'], 'SQSQueue1-URL')
 
     def test_create_change_set(self):
         cloudformation = aws_stack.connect_to_service('cloudformation')
@@ -235,3 +291,20 @@ class CloudFormationTest(unittest.TestCase):
         result = awslambda.invoke(FunctionName=func_name)
         result = json.loads(to_str(result['Payload'].read()))
         self.assertEqual(result, {'hello': 'world'})
+
+    def test_nested_stack(self):
+        s3 = aws_stack.connect_to_service('s3')
+        cloudformation = aws_stack.connect_to_service('cloudformation')
+
+        # upload template to S3
+        s3.create_bucket(Bucket=TEST_ARTIFACTS_BUCKET, ACL='public-read')
+        s3.put_object(Bucket=TEST_ARTIFACTS_BUCKET, Key=TEST_ARTIFACTS_PATH, Body=TEST_TEMPLATE_5)
+
+        # deploy template
+        buckets_before = len(s3.list_buckets()['Buckets'])
+        stack_name = 'stack-%s' % short_uid()
+        cloudformation.create_stack(StackName=stack_name, TemplateBody=TEST_TEMPLATE_6)
+
+        # assert that nested resources have been created
+        buckets_after = len(s3.list_buckets()['Buckets'])
+        self.assertEqual(buckets_after, buckets_before + 1)

@@ -103,6 +103,9 @@ class GenericProxyHandler(BaseHTTPRequestHandler):
             BaseHTTPRequestHandler.__init__(self, request, client_address, server)
         except SSLError as e:
             LOG.warning('SSL error when handling request: %s' % e)
+        except Exception as e:
+            if 'cannot read from timed out object' not in str(e):
+                LOG.warning('Unknown error: %s' % e)
 
     def parse_request(self):
         result = BaseHTTPRequestHandler.parse_request(self)
@@ -206,11 +209,14 @@ class GenericProxyHandler(BaseHTTPRequestHandler):
         forward_headers = CaseInsensitiveDict(self.headers)
 
         # force close connection
-        if forward_headers.get('Connection', '').lower() != 'keep-alive':
+        if forward_headers.get('Connection') not in ['keep-alive', None]:
             self.close_connection = 1
 
+        def is_full_url(url):
+            return re.match(r'[a-zA-Z]+://.+', url)
+
         path = self.path
-        if '://' in path:
+        if is_full_url(path):
             path = path.split('://', 1)[1]
             path = '/%s' % (path.split('/', 1)[1] if '/' in path else '')
         forward_base_url = self.proxy.forward_base_url
@@ -221,7 +227,7 @@ class GenericProxyHandler(BaseHTTPRequestHandler):
                 proxy_url = listener.get_forward_url(method, path, data, forward_headers) or proxy_url
 
         target_url = self.path
-        if '://' not in target_url:
+        if not is_full_url(target_url):
             target_url = '%s%s' % (forward_base_url, target_url)
 
         # update original "Host" header (moto s3 relies on this behavior)
@@ -286,7 +292,7 @@ class GenericProxyHandler(BaseHTTPRequestHandler):
                 kwargs = {
                     'method': method,
                     'path': path,
-                    'data': data,
+                    'data': self.data_bytes,
                     'headers': forward_headers,
                     'response': response
                 }
@@ -319,7 +325,8 @@ class GenericProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             trace = str(traceback.format_exc())
             conn_errors = ('ConnectionRefusedError', 'NewConnectionError',
-                           'Connection aborted', 'Unexpected EOF', 'Connection reset by peer')
+                           'Connection aborted', 'Unexpected EOF', 'Connection reset by peer',
+                           'cannot read from timed out object')
             conn_error = any(e in trace for e in conn_errors)
             error_msg = 'Error forwarding request: %s %s' % (e, trace)
             if 'Broken pipe' in trace:

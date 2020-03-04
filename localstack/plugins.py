@@ -1,21 +1,28 @@
 import os
 import sys
+from localstack.constants import TRUE_STRINGS
 from localstack.utils.bootstrap import ENV_SCRIPT_STARTING_DOCKER
 
 
 def register_localstack_plugins():
+    if os.environ.get(ENV_SCRIPT_STARTING_DOCKER) in TRUE_STRINGS:
+        # skip loading plugins for Docker launching, to increase startup speed
+        return
+
     # register default plugins
     try:
-        from localstack.services.es import es_starter
         from localstack.services.s3 import s3_listener, s3_starter
+        from localstack.services.ec2 import ec2_starter
         from localstack.services.kms import kms_starter
         from localstack.services.sns import sns_listener
         from localstack.services.sqs import sqs_listener, sqs_starter
         from localstack.services.iam import iam_listener, iam_starter
-        from localstack.services.infra import (register_plugin, Plugin,
+        from localstack.services.logs import logs_listener, logs_starter
+        from localstack.services.infra import (
             start_sns, start_ses, start_apigateway, start_elasticsearch_service, start_events, start_lambda,
             start_redshift, start_firehose, start_cloudwatch, start_dynamodbstreams, start_route53,
-            start_ssm, start_sts, start_secretsmanager, start_cloudwatch_logs, start_ec2)
+            start_ssm, start_sts, start_secretsmanager)
+        from localstack.services.plugins import Plugin, register_plugin
         from localstack.services.kinesis import kinesis_listener, kinesis_starter
         from localstack.services.dynamodb import dynamodb_listener, dynamodb_starter
         from localstack.services.apigateway import apigateway_listener
@@ -38,10 +45,7 @@ def register_localstack_plugins():
         register_plugin(Plugin('dynamodbstreams',
             start=start_dynamodbstreams))
         register_plugin(Plugin('ec2',
-            start=start_ec2))
-        register_plugin(Plugin('elasticsearch',
-            start=es_starter.start_elasticsearch,
-            check=es_starter.check_elasticsearch))
+            start=ec2_starter.start_ec2))
         register_plugin(Plugin('es',
             start=start_elasticsearch_service))
         register_plugin(Plugin('events',
@@ -61,7 +65,8 @@ def register_localstack_plugins():
         register_plugin(Plugin('lambda',
             start=start_lambda))
         register_plugin(Plugin('logs',
-            start=start_cloudwatch_logs))
+            start=logs_starter.start_cloudwatch_logs,
+            listener=logs_listener.UPDATE_LOGS))
         register_plugin(Plugin('redshift',
             start=start_redshift))
         register_plugin(Plugin('route53',

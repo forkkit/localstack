@@ -13,6 +13,7 @@ import socket
 import hashlib
 import decimal
 import logging
+import tarfile
 import zipfile
 import binascii
 import calendar
@@ -26,7 +27,7 @@ import dns.resolver
 import functools
 from io import BytesIO
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, date
 from six import with_metaclass
 from six.moves import cStringIO as StringIO
 from six.moves.urllib.parse import urlparse
@@ -63,6 +64,10 @@ LOG = logging.getLogger(__name__)
 # flag to indicate whether we've received and processed the stop signal
 INFRA_STOPPED = False
 
+# generic cache object
+CACHE = {}
+
+# lock for creating certificate files
 SSL_CERT_LOCK = threading.RLock()
 
 
@@ -75,7 +80,7 @@ class CustomEncoder(json.JSONEncoder):
                 return float(o)
             else:
                 return int(o)
-        if isinstance(o, datetime):
+        if isinstance(o, (datetime, date)):
             return str(o)
         if isinstance(o, six.binary_type):
             return to_str(o)
@@ -423,6 +428,10 @@ def timestamp(time=None, format=TIMESTAMP_FORMAT):
     return time.strftime(format)
 
 
+def timestamp_millis(time=None):
+    return timestamp(time=time, format=TIMESTAMP_FORMAT_MILLIS)
+
+
 def retry(function, retries=3, sleep=1, sleep_before=0, **kwargs):
     raise_error = None
     if sleep_before > 0:
@@ -442,7 +451,7 @@ def dump_thread_info():
     print(run("ps aux | grep 'node\\|java\\|python'"))
 
 
-def merge_recursive(source, destination):
+def merge_recursive(source, destination, none_values=[None]):
     for key, value in source.items():
         if isinstance(value, dict):
             # get node or create one
@@ -452,7 +461,8 @@ def merge_recursive(source, destination):
             if not isinstance(destination, dict):
                 LOG.warning('Destination for merging %s=%s is not dict: %s' %
                     (key, value, destination))
-            destination[key] = value
+            if destination.get(key) in none_values:
+                destination[key] = value
     return destination
 
 
@@ -497,15 +507,18 @@ def obj_to_xml(obj):
     return str(obj)
 
 
-def now_utc():
-    return mktime(datetime.utcnow())
+def now_utc(millis=False):
+    return mktime(datetime.utcnow(), millis=millis)
 
 
-def now():
-    return mktime(datetime.now())
+def now(millis=False):
+    return mktime(datetime.now(), millis=millis)
 
 
-def mktime(timestamp):
+def mktime(timestamp, millis=False):
+    if millis:
+        epoch = datetime.utcfromtimestamp(0)
+        return (timestamp - epoch).total_seconds()
     return calendar.timegm(timestamp.timetuple())
 
 
@@ -558,6 +571,12 @@ def rm_rf(path):
     """
     if not path or not os.path.exists(path):
         return
+    # Running the native command can be an order of magnitude faster in Alpine on Travis-CI
+    if is_alpine():
+        try:
+            return run('rm -rf "%s"' % path)
+        except Exception:
+            pass
     # Make sure all files are writeable and dirs executable to remove
     chmod_r(path, 0o777)
     # check if the file is either a normal file, or, e.g., a fifo
@@ -582,6 +601,10 @@ def download(url, path, verify_ssl=True):
     # enable parallel file downloads during installation!
     s = requests.Session()
     r = s.get(url, stream=True, verify=verify_ssl)
+    # check status code before attempting to read body
+    if r.status_code >= 400:
+        raise Exception('Failed to download %s, response code %s' % (url, r.status_code))
+
     total = 0
     try:
         if not os.path.exists(os.path.dirname(path)):
@@ -597,8 +620,13 @@ def download(url, path, verify_ssl=True):
                     LOG.debug('Empty chunk %s (total %s) from %s' % (chunk, total, url))
             f.flush()
             os.fsync(f)
+        if os.path.getsize(path) == 0:
+            LOG.warning('Zero bytes downloaded from %s, retrying' % url)
+            download(url, path, verify_ssl)
+            return
+        LOG.debug('Done downloading %s, response code %s, total bytes %d' % (url, r.status_code, total))
     finally:
-        LOG.debug('Done downloading %s, response code %s' % (url, r.status_code))
+        LOG.debug('Cleaning up file handles for download of %s' % url)
         r.close()
         s.close()
 
@@ -619,6 +647,10 @@ def parse_chunked_data(data):
     return ''.join(chunks)
 
 
+def first_char_to_lower(s):
+    return '%s%s' % (s[0].lower(), s[1:])
+
+
 def is_number(s):
     try:
         float(s)  # for int, long and float
@@ -637,12 +669,15 @@ def is_linux():
 
 def is_alpine():
     try:
-        if not os.path.exists('/etc/issue'):
-            return False
-        out = to_str(subprocess.check_output('cat /etc/issue', shell=True))
-        return 'Alpine' in out
+        if '_is_alpine_' not in CACHE:
+            CACHE['_is_alpine_'] = False
+            if not os.path.exists('/etc/issue'):
+                return False
+            out = to_str(subprocess.check_output('cat /etc/issue', shell=True))
+            CACHE['_is_alpine_'] = 'Alpine' in out
     except subprocess.CalledProcessError:
         return False
+    return CACHE['_is_alpine_']
 
 
 def get_arch():
@@ -773,7 +808,11 @@ def is_zip_file(content):
     return zipfile.is_zipfile(stream)
 
 
-def unzip(path, target_dir):
+def unzip(path, target_dir, overwrite=True):
+    if is_alpine():
+        # Running the native command can be an order of magnitude faster in Alpine on Travis-CI
+        flags = '-o' if overwrite else ''
+        return run('cd %s; unzip %s %s' % (target_dir, flags, path))
     try:
         zip_ref = zipfile.ZipFile(path, 'r')
     except Exception as e:
@@ -781,9 +820,11 @@ def unzip(path, target_dir):
         raise e
     # Make sure to preserve file permissions in the zip file
     # https://www.burgundywall.com/post/preserving-file-perms-with-python-zipfile-module
-    for file_entry in zip_ref.infolist():
-        _unzip_file_entry(zip_ref, file_entry, target_dir)
-    zip_ref.close()
+    try:
+        for file_entry in zip_ref.infolist():
+            _unzip_file_entry(zip_ref, file_entry, target_dir)
+    finally:
+        zip_ref.close()
 
 
 def _unzip_file_entry(zip_ref, file_entry, target_dir):
@@ -794,6 +835,28 @@ def _unzip_file_entry(zip_ref, file_entry, target_dir):
     out_path = os.path.join(target_dir, file_entry.filename)
     perm = file_entry.external_attr >> 16
     os.chmod(out_path, perm or 0o777)
+
+
+def untar(path, target_dir):
+    mode = 'r:gz' if path.endswith('gz') else 'r'
+    with tarfile.open(path, mode) as tar:
+        tar.extractall(path=target_dir)
+
+
+def zip_contains_jar_entries(content, jar_path_prefix=None, match_single_jar=True):
+    try:
+        with tempfile.NamedTemporaryFile() as tf:
+            tf.write(content)
+            tf.flush()
+            with zipfile.ZipFile(tf.name, 'r') as zf:
+                jar_entries = [e for e in zf.infolist() if e.filename.lower().endswith('.jar')]
+                if match_single_jar and len(jar_entries) == 1 and len(zf.infolist()) == 1:
+                    return True
+                matching_prefix = [e for e in jar_entries if
+                    not jar_path_prefix or e.filename.lower().startswith(jar_path_prefix)]
+                return len(matching_prefix) > 0
+    except Exception:
+        return False
 
 
 def is_jar_archive(content):
@@ -865,8 +928,9 @@ def generate_ssl_cert(target_file=None, overwrite=False, random=False, return_co
     cert.gmtime_adj_notAfter(2 * 365 * 24 * 60 * 60)
     cert.set_issuer(cert.get_subject())
     cert.set_pubkey(k)
+    alt_names = b'DNS:localhost,DNS:test.localhost.atlassian.io,IP:127.0.0.1'
     cert.add_extensions([
-        crypto.X509Extension(b'subjectAltName', False, b'DNS:localhost,IP:127.0.0.1'),
+        crypto.X509Extension(b'subjectAltName', False, alt_names),
         crypto.X509Extension(b'basicConstraints', True, b'CA:false'),
         crypto.X509Extension(b'keyUsage', True, b'nonRepudiation,digitalSignature,keyEncipherment'),
         crypto.X509Extension(b'extendedKeyUsage', True, b'serverAuth')
@@ -950,6 +1014,10 @@ def run(cmd, cache_duration_secs=0, **kwargs):
 
 def clone(item):
     return json.loads(json.dumps(item))
+
+
+def clone_safe(item):
+    return clone(json_safe(item))
 
 
 def remove_non_ascii(text):

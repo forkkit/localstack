@@ -2,6 +2,9 @@ import os
 import re
 import json
 import unittest
+import mock
+import time
+import datetime
 from localstack.utils.common import save_file, new_tmp_dir, mkdir
 from localstack.services.awslambda import lambda_api, lambda_executors
 from localstack.utils.aws.aws_models import LambdaFunction
@@ -88,6 +91,128 @@ class TestLambdaAPI(unittest.TestCase):
             result = lambda_api.delete_event_source_mapping(self.TEST_UUID)
             self.assertEqual(json.loads(result.get_data()).get('UUID'), self.TEST_UUID)
             self.assertEqual(0, len(lambda_api.event_source_mappings))
+
+    def test_invoke_RETURNS_415_WHEN_not_json_input(self):
+        with self.app.test_request_context() as context:
+            context.request._cached_data = '~notjsonrequest~'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual('415 UNSUPPORTED MEDIA TYPE', response.status)
+
+    def _request_response(self, context):
+        context.request._cached_data = '{}'
+        context.request.args = {'Qualifier': '$LATEST'}
+        context.request.environ['HTTP_X_AMZ_INVOCATION_TYPE'] = 'RequestResponse'
+        self._create_function(self.FUNCTION_NAME)
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_plain_text_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = '~notjsonresponse~'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual('~notjsonresponse~', response[0])
+            self.assertEqual(200, response[1])
+            self.assertEqual({'Content-Type': 'text/plain'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_empty_plain_text_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = ''
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual('', response[0])
+            self.assertEqual(200, response[1])
+            self.assertEqual({'Content-Type': 'text/plain'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_empty_map_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = '{}'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'{}\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEquals({'Content-Type': 'application/json'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_populated_map_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = '{"bool":true,"int":1}'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'{"bool":true,"int":1}\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEquals({'Content-Type': 'application/json'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_empty_list_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = '[]'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'[]\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEquals({'Content-Type': 'application/json'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_populated_list_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = '[true,1,"thing"]'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'[true,1,"thing"]\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEquals({'Content-Type': 'application/json'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_string_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = '"thing"'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'"thing"\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEqual({'Content-Type': 'application/json'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_integer_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = '1234'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'1234\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEqual({'Content-Type': 'application/json'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_float_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = '1.3'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'1.3\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEqual({'Content-Type': 'application/json'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_boolean_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = 'true'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'true\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEqual({'Content-Type': 'application/json'}, response[2])
+
+    @mock.patch('localstack.services.awslambda.lambda_api.run_lambda')
+    def test_invoke_null_json_response(self, mock_run_lambda):
+        with self.app.test_request_context() as context:
+            self._request_response(context)
+            mock_run_lambda.return_value = 'null'
+            response = lambda_api.invoke_function(self.FUNCTION_NAME)
+            self.assertEqual(b'null\n', response[0].response[0])
+            self.assertEqual(200, response[1])
+            self.assertEqual({'Content-Type': 'application/json'}, response[2])
 
     def test_create_event_source_mapping(self):
         self.client.post('{0}/event-source-mappings/'.format(lambda_api.PATH_ROOT),
@@ -475,6 +600,23 @@ class TestLambdaAPI(unittest.TestCase):
 
     def test_get_java_lib_folder_classpath_archive_is_None(self):
         self.assertRaises(TypeError, lambda_executors.Util.get_java_classpath, None)
+
+    @mock.patch('localstack.services.awslambda.lambda_executors.store_cloudwatch_logs')
+    def test_executor_store_logs_can_handle_milliseconds(self, mock_store_cloudwatch_logs):
+        mock_details = mock.Mock()
+        executor = lambda_executors.LambdaExecutor()
+        t_sec = time.time()  # plain old epoch secs
+        t_ms = time.time() * 1000  # epoch ms as a long-int like AWS
+
+        # pass t_ms millisecs to _store_logs
+        executor._store_logs(mock_details, 'mock log output', t_ms)
+
+        # expect the computed log-stream-name to having a prefix matching the date derived from t_sec
+        today = datetime.datetime.utcfromtimestamp(t_sec).strftime('%Y/%m/%d')
+        log_stream_name = mock_store_cloudwatch_logs.call_args_list[0].args[1]
+        parts = log_stream_name.split('/')
+        date_part = '/'.join(parts[:3])
+        self.assertEqual(date_part, today)
 
     def _create_function(self, function_name, tags={}):
         arn = lambda_api.func_arn(function_name)

@@ -8,7 +8,7 @@ from requests.models import Request, Response
 from six.moves.urllib import parse as urlparse
 from samtranslator.translator.transform import transform as transform_sam
 from localstack.utils.aws import aws_stack
-from localstack.utils.common import to_str, obj_to_xml, safe_requests, run_safe
+from localstack.utils.common import to_str, obj_to_xml, safe_requests, run_safe, timestamp
 from localstack.utils.analytics import event_publisher
 from localstack.utils.cloudformation import template_deployer
 from localstack.services.generic_proxy import ProxyListener
@@ -101,7 +101,9 @@ def get_template_body(req_data):
     url = req_data.get('TemplateURL')
     if url:
         response = run_safe(lambda: safe_requests.get(url, verify=False))
-        if not response or response.status_code >= 400:
+        # check error codes, and code 301 - fixes https://github.com/localstack/localstack/issues/1884
+        status_code = 0 if response is None else response.status_code
+        if not response or status_code == 301 or status_code >= 400:
             # check if this is an S3 URL, then get the file directly from there
             if '://localhost' in url or re.match(r'.*s3(\-website)?\.([^\.]+\.)?amazonaws.com.*', url):
                 parsed_path = urlparse.urlparse(url).path.lstrip('/')
@@ -110,9 +112,16 @@ def get_template_body(req_data):
                 result = client.get_object(Bucket=parts[0], Key=parts[2])
                 body = to_str(result['Body'].read())
                 return body
-            raise Exception('Unable to fetch template body (code %s) from URL %s' % (response.status_code, url))
+            raise Exception('Unable to fetch template body (code %s) from URL %s' % (status_code, url))
         return response.content
     raise Exception('Unable to get template body from input: %s' % req_data)
+
+
+def fix_hardcoded_creation_date(response):
+    search = '<CreationTime>2011-05-23T15:47:44Z</CreationTime>'
+    replace = '<CreationTime>%s</CreationTime>' % timestamp()
+    response._content = to_str(response._content or '').replace(search, replace)
+    response.headers['Content-Length'] = str(len(response._content))
 
 
 class ProxyListenerCloudFormation(ProxyListener):
@@ -126,15 +135,19 @@ class ProxyListenerCloudFormation(ProxyListener):
             req_data = urlparse.parse_qs(to_str(data))
             req_data = dict([(k, v[0]) for k, v in req_data.items()])
             action = req_data.get('Action')
+            stack_name = req_data.get('StackName')
 
             if action == 'CreateStack':
-                stack_name = req_data.get('StackName')
                 event_publisher.fire_event(event_publisher.EVENT_CLOUDFORMATION_CREATE_STACK,
                     payload={'n': event_publisher.get_hash(stack_name)})
 
+            if action == 'DeleteStack':
+                client = aws_stack.connect_to_service('cloudformation')
+                stack_resources = client.list_stack_resources(StackName=stack_name)['StackResourceSummaries']
+                template_deployer.delete_stack(stack_name, stack_resources)
+
             if action == 'DescribeStackEvents':
                 # fix an issue where moto cannot handle ARNs as stack names (or missing names)
-                stack_name = req_data.get('StackName')
                 run_fix = not stack_name
                 if stack_name:
                     if stack_name.startswith('arn:aws:cloudformation'):
@@ -169,12 +182,20 @@ class ProxyListenerCloudFormation(ProxyListener):
         if response.status_code >= 400:
             LOG.debug('Error response from CloudFormation (%s) %s %s: %s' %
                       (response.status_code, method, path, response.content))
+
         if response._content:
             aws_stack.fix_account_id_in_arns(response)
+            fix_hardcoded_creation_date(response)
 
     def _list_stack_names(self):
         client = aws_stack.connect_to_service('cloudformation')
-        stack_names = [s['StackName'] for s in client.list_stacks()['StackSummaries']]
+        stacks = client.list_stacks()['StackSummaries']
+        stack_names = []
+        for stack in stacks:
+            status = stack['StackStatus']
+            if 'FAILED' in status or 'DELETE' in status:
+                continue
+            stack_names.append(stack['StackName'])
         return stack_names
 
 

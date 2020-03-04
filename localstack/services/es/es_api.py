@@ -2,11 +2,13 @@ import json
 import time
 from random import randint
 from flask import Flask, jsonify, request, make_response
+from localstack.utils import persistence
 from localstack.services import generic_proxy
 from localstack.utils.aws import aws_stack
 from localstack.constants import TEST_AWS_ACCOUNT_ID
 from localstack.utils.common import to_str
 from localstack.utils.analytics import event_publisher
+from localstack.services.plugins import check_infra, Plugin
 
 APP_NAME = 'es_api'
 API_PREFIX = '/2015-01-01'
@@ -158,6 +160,27 @@ def get_domain_status(domain_name, deleted=False):
     }
 
 
+def start_elasticsearch_instance():
+    # Note: keep imports here to avoid circular dependencies
+    from localstack.services.es import es_starter
+
+    api_name = 'elasticsearch'
+    plugin = Plugin(api_name, start=es_starter.start_elasticsearch, check=es_starter.check_elasticsearch)
+    t1 = plugin.start(asynchronous=True)
+    # sleep some time to give Elasticsearch enough time to come up
+    time.sleep(8)
+    apis = [api_name]
+    # ensure that all infra components are up and running
+    check_infra(apis=apis, additional_checks=[es_starter.check_elasticsearch])
+    return t1
+
+
+def cleanup_elasticsearch_instance():
+    # Note: keep imports here to avoid circular dependencies
+    from localstack.services.es import es_starter
+    es_starter.stop_elasticsearch()
+
+
 @app.route('%s/domain' % API_PREFIX, methods=['GET'])
 def list_domain_names():
     result = {
@@ -173,10 +196,15 @@ def create_domain():
     if domain_name in ES_DOMAINS:
         return error_response(error_type='ResourceAlreadyExistsException')
     ES_DOMAINS[domain_name] = data
+    # start actual Elasticsearch instance
+    start_elasticsearch_instance()
     result = get_domain_status(domain_name)
+
     # record event
     event_publisher.fire_event(event_publisher.EVENT_ES_CREATE_DOMAIN,
         payload={'n': event_publisher.get_hash(domain_name)})
+    persistence.record('es', request=request)
+
     return jsonify(result)
 
 
@@ -185,6 +213,20 @@ def describe_domain(domain_name):
     if domain_name not in ES_DOMAINS:
         return error_response(error_type='ResourceNotFoundException')
     result = get_domain_status(domain_name)
+    return jsonify(result)
+
+
+@app.route('%s/es/domain-info' % API_PREFIX, methods=['POST'])
+def describe_domains():
+    data = json.loads(to_str(request.data))
+    result = []
+    domain_names = data.get('DomainNames', [])
+    for domain_name in ES_DOMAINS:
+        if domain_name in domain_names:
+            status = get_domain_status(domain_name)
+            status = status.get('DomainStatus') or status
+            result.append(status)
+    result = {'DomainStatusList': result}
     return jsonify(result)
 
 
@@ -200,10 +242,30 @@ def delete_domain(domain_name):
         return error_response(error_type='ResourceNotFoundException')
     result = get_domain_status(domain_name, deleted=True)
     ES_DOMAINS.pop(domain_name)
+    if not ES_DOMAINS:
+        cleanup_elasticsearch_instance()
+
     # record event
     event_publisher.fire_event(event_publisher.EVENT_ES_DELETE_DOMAIN,
         payload={'n': event_publisher.get_hash(domain_name)})
+    persistence.record('es', request=request)
+
     return jsonify(result)
+
+
+@app.route('%s/es/compatibleVersions' % API_PREFIX, methods=['GET'])
+def get_compatible_versions():
+    result = [{
+        'SourceVersion': '6.5',
+        'TargetVersions': ['6.7', '6.8']
+    }, {
+        'SourceVersion': '6.7',
+        'TargetVersions': ['6.8']
+    }, {
+        'SourceVersion': '6.8',
+        'TargetVersions': ['7.1']
+    }]
+    return jsonify({'CompatibleElasticsearchVersions': result})
 
 
 @app.route('%s/tags' % API_PREFIX, methods=['GET', 'POST'])

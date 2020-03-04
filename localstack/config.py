@@ -192,9 +192,10 @@ try:
         if LOCALSTACK_HOSTNAME == HOSTNAME:
             DOCKER_HOST_FROM_CONTAINER = 'host.docker.internal'
     # update LOCALSTACK_HOSTNAME if host.docker.internal is available
-    if is_in_docker and LOCALSTACK_HOSTNAME == DOCKER_BRIDGE_IP:
+    if is_in_docker:
         DOCKER_HOST_FROM_CONTAINER = socket.gethostbyname('host.docker.internal')
-        LOCALSTACK_HOSTNAME = DOCKER_HOST_FROM_CONTAINER
+        if LOCALSTACK_HOSTNAME == DOCKER_BRIDGE_IP:
+            LOCALSTACK_HOSTNAME = DOCKER_HOST_FROM_CONTAINER
 except socket.error:
     pass
 
@@ -283,8 +284,9 @@ def service_port(service_key):
     return SERVICE_PORTS.get(service_key, 0)
 
 
-def external_service_url(service_key):
-    return 'http%s://%s:%s' % ('s' if USE_SSL else '', HOSTNAME_EXTERNAL, service_port(service_key))
+def external_service_url(service_key, host=None):
+    host = host or HOSTNAME_EXTERNAL
+    return 'http%s://%s:%s' % ('s' if USE_SSL else '', host, service_port(service_key))
 
 
 # initialize config values

@@ -4,9 +4,9 @@ import base64
 import re
 import json
 import unittest
+import xmltodict
 from jsonpatch import apply_patch
 from requests.models import Response
-from xml.dom.minidom import parseString
 from requests.structures import CaseInsensitiveDict
 from localstack import config
 from localstack.constants import PATH_USER_REQUEST, TEST_AWS_ACCOUNT_ID
@@ -58,8 +58,8 @@ class TestAPIGatewayIntegrations(unittest.TestCase):
     TEST_STAGE_NAME = 'testing'
     TEST_LAMBDA_PROXY_BACKEND = 'test_lambda_apigw_backend'
     TEST_LAMBDA_PROXY_BACKEND_WITH_PATH_PARAM = 'test_lambda_apigw_backend_path_param'
-    TEST_LAMBDA_PROXY_BACKEND_ANY_METHOD = 'test_ARMlambda_apigw_backend_any_method'
-    TEST_LAMBDA_PROXY_BACKEND_ANY_METHOD_WITH_PATH_PARAM = 'test_ARMlambda_apigw_backend_any_method_path_param'
+    TEST_LAMBDA_PROXY_BACKEND_ANY_METHOD = 'test_lambda_apigw_backend_any_method'
+    TEST_LAMBDA_PROXY_BACKEND_ANY_METHOD_WITH_PATH_PARAM = 'test_lambda_apigw_backend_any_method_path_param'
     TEST_LAMBDA_SQS_HANDLER_NAME = 'lambda_sqs_handler'
     TEST_LAMBDA_AUTHORIZER_HANDLER_NAME = 'lambda_authorizer_handler'
     TEST_API_GATEWAY_ID = 'fugvjdxtri'
@@ -149,11 +149,11 @@ class TestAPIGatewayIntegrations(unittest.TestCase):
         result = requests.post(url, data=json.dumps(test_data))
         self.assertEqual(result.status_code, 200)
 
-        parsed_content = parseString(result.content)
-        root = parsed_content.documentElement.childNodes[1]
+        parsed_json = xmltodict.parse(result.content)
+        result = parsed_json['SendMessageResponse']['SendMessageResult']
 
-        attr_md5 = root.childNodes[1].lastChild.nodeValue
-        body_md5 = root.childNodes[3].lastChild.nodeValue
+        attr_md5 = result['MD5OfMessageAttributes']
+        body_md5 = result['MD5OfMessageBody']
 
         self.assertEqual(attr_md5, 'd41d8cd98f00b204e9800998ecf8427e')
         self.assertEqual(body_md5, 'b639f52308afd65866c86f274c59033f')
@@ -256,7 +256,6 @@ class TestAPIGatewayIntegrations(unittest.TestCase):
             self.API_PATH_LAMBDA_PROXY_BACKEND_WITH_PATH_PARAM)
 
     def _test_api_gateway_lambda_proxy_integration(self, fn_name, path):
-
         self.create_lambda_function(fn_name)
         # create API Gateway and connect it to the Lambda proxy backend
         lambda_uri = aws_stack.lambda_function_arn(fn_name)

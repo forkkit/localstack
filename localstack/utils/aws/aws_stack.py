@@ -119,11 +119,20 @@ def is_local_env(env):
     return not env or env.region == REGION_LOCAL or env.prefix == ENV_DEV
 
 
-def connect_to_resource(service_name, env=None, region_name=None, endpoint_url=None):
-    """
-    Generic method to obtain an AWS service resource using boto3, based on environment, region, or custom endpoint_url.
-    """
-    return connect_to_service(service_name, client=False, env=env, region_name=region_name, endpoint_url=endpoint_url)
+class Boto3Session(boto3.session.Session):
+    """ Custom boto3 session that points to local endpoint URLs. """
+
+    def resource(self, service, *args, **kwargs):
+        self._fix_endpoint(kwargs)
+        return connect_to_resource(service, *args, **kwargs)
+
+    def client(self, service, *args, **kwargs):
+        self._fix_endpoint(kwargs)
+        return connect_to_service(service, *args, **kwargs)
+
+    def _fix_endpoint(self, kwargs):
+        if 'amazonaws.com' in kwargs.get('endpoint_url', ''):
+            kwargs.pop('endpoint_url')
 
 
 def get_boto3_credentials():
@@ -164,7 +173,10 @@ def get_local_service_url(service_name_or_port):
     service_name = service_name_or_port
     if service_name == 's3api':
         service_name = 's3'
-    return os.environ['TEST_%s_URL' % (service_name.upper().replace('-', '_'))]
+    elif service_name == 'runtime.sagemaker':
+        service_name = 'sagemaker-runtime'
+    service_name_upper = service_name.upper().replace('-', '_').replace('.', '_')
+    return os.environ['TEST_%s_URL' % service_name_upper]
 
 
 def is_service_enabled(service_name):
@@ -177,7 +189,15 @@ def is_service_enabled(service_name):
         return False
 
 
-def connect_to_service(service_name, client=True, env=None, region_name=None, endpoint_url=None, config=None):
+def connect_to_resource(service_name, env=None, region_name=None, endpoint_url=None, *args, **kwargs):
+    """
+    Generic method to obtain an AWS service resource using boto3, based on environment, region, or custom endpoint_url.
+    """
+    return connect_to_service(service_name, client=False, env=env, region_name=region_name, endpoint_url=endpoint_url)
+
+
+def connect_to_service(service_name, client=True, env=None, region_name=None, endpoint_url=None,
+        config=None, *args, **kwargs):
     """
     Generic method to obtain an AWS service client using boto3, based on environment, region, or custom endpoint_url.
     """
@@ -218,6 +238,9 @@ class VelocityInput:
     def json(self, path):
         return json.dumps(self.path(path))
 
+    def __repr__(self):
+        return '$input'
+
 
 class VelocityUtil:
     """Simple class to mimick the behavior of variable '$util' in AWS API Gateway integration velocity templates.
@@ -240,6 +263,10 @@ class VelocityUtil:
 
 def render_velocity_template(template, context, variables={}, as_json=False):
     import airspeed
+
+    # run a few fixes to properly prepare the template
+    template = re.sub(r'(^|\n)#\s+set(.*)', r'\1#set\2', template, re.MULTILINE)
+
     t = airspeed.Template(template)
     var_map = {
         'input': VelocityInput(context),
@@ -278,7 +305,7 @@ def set_default_region_in_headers(headers):
 
 def fix_account_id_in_arns(response, colon_delimiter=':', existing=None, replace=None):
     """ Fix the account ID in the ARNs returned in the given Flask response or string """
-    existing = existing or ['123456789', MOTO_ACCOUNT_ID]
+    existing = existing or ['123456789', '1234567890', MOTO_ACCOUNT_ID]
     existing = existing if isinstance(existing, list) else [existing]
     replace = replace or TEST_AWS_ACCOUNT_ID
     is_str_obj = is_string_or_bytes(response)
@@ -299,8 +326,7 @@ def fix_account_id_in_arns(response, colon_delimiter=':', existing=None, replace
 def get_s3_client():
     return boto3.resource('s3',
         endpoint_url=config.TEST_S3_URL,
-        config=boto3.session.Config(
-            s3={'addressing_style': 'path'}),
+        config=boto3.session.Config(s3={'addressing_style': 'path'}),
         verify=False)
 
 
@@ -347,6 +373,11 @@ def get_iam_role(resource, env=None):
     return 'role-%s' % resource
 
 
+def cloudformation_stack_arn(stack_name, account_id=None, region_name=None):
+    pattern = 'arn:aws:cloudformation:%s:%s:stack/%s/id-1234'
+    return _resource_arn(stack_name, pattern, account_id=account_id, region_name=region_name)
+
+
 def dynamodb_table_arn(table_name, account_id=None, region_name=None):
     pattern = 'arn:aws:dynamodb:%s:%s:table/%s'
     return _resource_arn(table_name, pattern, account_id=account_id, region_name=region_name)
@@ -356,6 +387,11 @@ def dynamodb_stream_arn(table_name, latest_stream_label, account_id=None):
     account_id = get_account_id(account_id)
     return ('arn:aws:dynamodb:%s:%s:table/%s/stream/%s' %
         (get_region(), account_id, table_name, latest_stream_label))
+
+
+def log_group_arn(group_name, account_id=None, region_name=None):
+    pattern = 'arn:aws:logs:%s:%s:log-group:%s'
+    return _resource_arn(group_name, pattern, account_id=account_id, region_name=region_name)
 
 
 def lambda_function_arn(function_name, account_id=None, region_name=None):

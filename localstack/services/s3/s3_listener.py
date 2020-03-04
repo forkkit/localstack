@@ -24,6 +24,9 @@ from localstack.utils.aws.aws_responses import requests_response
 from localstack.services.s3 import multipart_content
 from localstack.services.generic_proxy import ProxyListener
 
+CONTENT_SHA256_HEADER = 'x-amz-content-sha256'
+STREAMING_HMAC_PAYLOAD = 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD'
+
 # mappings for S3 bucket notifications
 S3_NOTIFICATIONS = {}
 
@@ -107,7 +110,7 @@ def prefix_with_slash(s):
     return s if s[0] == '/' else '/%s' % s
 
 
-def get_event_message(event_name, bucket_name, file_name='testfile.txt', version_id=None, file_size=1024):
+def get_event_message(event_name, bucket_name, file_name='testfile.txt', version_id=None, file_size=0):
     # Based on: http://docs.aws.amazon.com/AmazonS3/latest/dev/notification-content-structure.html
     bucket_name = normalize_bucket_name(bucket_name)
     return {
@@ -179,16 +182,28 @@ def send_notifications(method, bucket_name, object_path, version_id):
 def send_notification_for_subscriber(notif, bucket_name, object_path, version_id, api_method, action, event_name):
     bucket_name = normalize_bucket_name(bucket_name)
 
-    if (not event_type_matches(notif['Event'], action, api_method) or
-            not filter_rules_match(notif.get('Filter'), object_path)):
+    if not event_type_matches(notif['Event'], action, api_method) or \
+            not filter_rules_match(notif.get('Filter'), object_path):
         return
-    # send notification
+
+    key = urlparse.unquote(object_path.replace('//', '/'))[1:]
+
+    s3_client = aws_stack.connect_to_service('s3')
+    try:
+        object_size = s3_client.head_object(Bucket=bucket_name, Key=key).get('ContentLength', 0)
+    except botocore.exceptions.ClientError:
+        object_size = 0
+
+    # build event message
     message = get_event_message(
-        event_name=event_name, bucket_name=bucket_name,
-        file_name=urlparse.urlparse(object_path[1:]).path,
+        event_name=event_name,
+        bucket_name=bucket_name,
+        file_name=key,
+        file_size=object_size,
         version_id=version_id
     )
     message = json.dumps(message)
+
     if notif.get('Queue'):
         sqs_client = aws_stack.connect_to_service('sqs')
         try:
@@ -303,7 +318,7 @@ def append_last_modified_headers(response, content=None):
     time_format = '%a, %d %b %Y %H:%M:%S GMT'  # TimeFormat
     try:
         if content:
-            last_modified_str = re.findall(r'<LastModified>(.*)</LastModified>', content)
+            last_modified_str = re.findall(r'<LastModified>([^<]*)</LastModified>', content)
             if last_modified_str:
                 last_modified_str = last_modified_str[0]
                 last_modified_time_format = dateutil.parser.parse(last_modified_str).strftime(time_format)
@@ -354,9 +369,90 @@ def fix_location_constraint(response):
         remove_xml_preamble(response)
 
 
+def fix_range_content_type(bucket_name, path, headers, response):
+    # Fix content type for Range requests - https://github.com/localstack/localstack/issues/1259
+    if 'Range' not in headers:
+        return
+
+    s3_client = aws_stack.connect_to_service('s3')
+    path = urlparse.unquote(path)
+    key_name = get_key_name(path, headers)
+    result = s3_client.head_object(Bucket=bucket_name, Key=key_name)
+    content_type = result['ContentType']
+    if response.headers.get('Content-Type') == 'text/html; charset=utf-8':
+        response.headers['Content-Type'] = content_type
+
+
+def fix_delete_objects_response(bucket_name, method, parsed_path, data, headers, response):
+    # Deleting non-existing keys should not result in errors.
+    # Fixes https://github.com/localstack/localstack/issues/1893
+    if not (method == 'POST' and parsed_path.query == 'delete' and '<Delete' in to_str(data or '')):
+        return
+    content = to_str(response._content)
+    if '<Error>' not in content:
+        return
+    result = xmltodict.parse(content).get('DeleteResult')
+    errors = result.get('Error')
+    errors = errors if isinstance(errors, list) else [errors]
+    deleted = result.get('Deleted')
+    if not isinstance(result.get('Deleted'), list):
+        deleted = result['Deleted'] = [deleted] if deleted else []
+    for entry in list(errors):
+        if set(entry.keys()) == set(['Key']):
+            errors.remove(entry)
+            deleted.append(entry)
+    if not errors:
+        result.pop('Error')
+    response._content = xmltodict.unparse({'DeleteResult': result})
+
+
+def fix_metadata_key_underscores(request_headers={}, response=None):
+    # fix for https://github.com/localstack/localstack/issues/1790
+    underscore_replacement = '---'
+    meta_header_prefix = 'x-amz-meta-'
+    prefix_len = len(meta_header_prefix)
+    updated = False
+    for key in list(request_headers.keys()):
+        if key.lower().startswith(meta_header_prefix):
+            key_new = meta_header_prefix + key[prefix_len:].replace('_', underscore_replacement)
+            if key != key_new:
+                request_headers[key_new] = request_headers.pop(key)
+                updated = True
+    if response:
+        for key in list(response.headers.keys()):
+            if key.lower().startswith(meta_header_prefix):
+                key_new = meta_header_prefix + key[prefix_len:].replace(underscore_replacement, '_')
+                if key != key_new:
+                    response.headers[key_new] = response.headers.pop(key)
+    return updated
+
+
+def fix_creation_date(method, path, response):
+    if method != 'GET' or path != '/':
+        return
+    response._content = re.sub(r'([0-9])</CreationDate>', r'\1Z</CreationDate>', to_str(response._content))
+
+
+def fix_etag_for_multipart(data, headers, response):
+    # Fix for https://github.com/localstack/localstack/issues/1978
+    if headers.get(CONTENT_SHA256_HEADER) == STREAMING_HMAC_PAYLOAD:
+        try:
+            if b'chunk-signature=' not in to_bytes(data):
+                return
+            correct_hash = md5(strip_chunk_signatures(data))
+            tags = r'<ETag>%s</ETag>'
+            pattern = r'(&#34;)?([^<&]+)(&#34;)?'
+            replacement = r'\g<1>%s\g<3>' % correct_hash
+            response._content = re.sub(tags % pattern, tags % replacement, to_str(response.content))
+            if response.headers.get('ETag'):
+                response.headers['ETag'] = re.sub(pattern, replacement, response.headers['ETag'])
+        except Exception:
+            pass
+
+
 def remove_xml_preamble(response):
     """ Removes <?xml ... ?> from a response content """
-    response._content = re.sub(r'^<\?[^\?]+\?>', '', response._content)
+    response._content = re.sub(r'^<\?[^\?]+\?>', '', to_str(response._content))
 
 
 # --------------
@@ -556,16 +652,28 @@ def normalize_bucket_name(bucket_name):
     return bucket_name
 
 
+def get_key_name(path, headers):
+    parsed = urlparse.urlparse(path)
+    path_parts = parsed.path.lstrip('/').split('/', 1)
+
+    if uses_path_addressing(headers):
+        return path_parts[1]
+    return path_parts[0]
+
+
+def uses_path_addressing(headers):
+    host = headers['host']
+    return host.startswith(HOSTNAME) or host.startswith(HOSTNAME_EXTERNAL)
+
+
 def get_bucket_name(path, headers):
     parsed = urlparse.urlparse(path)
 
     # try pick the bucket_name from the path
     bucket_name = parsed.path.split('/')[1]
 
-    host = headers['host']
-
-    # is the hostname not starting a bucket name?
-    if host.startswith(HOSTNAME) or host.startswith(HOSTNAME_EXTERNAL):
+    # is the hostname not starting with a bucket name?
+    if uses_path_addressing(headers):
         return normalize_bucket_name(bucket_name)
 
     # matches the common endpoints like
@@ -585,6 +693,7 @@ def get_bucket_name(path, headers):
 
     # if any of the above patterns match, the first captured group
     # will be returned as the bucket name
+    host = headers['host']
     for pattern in [common_pattern, dualstack_pattern, legacy_patterns]:
         match = pattern.match(host)
         if match:
@@ -688,7 +797,7 @@ class ProxyListenerS3(ProxyListener):
         # Related isse: https://github.com/localstack/localstack/issues/98
         # TODO we should evaluate whether to replace moto s3 with scality/S3:
         # https://github.com/scality/S3/issues/237
-        if headers.get('x-amz-content-sha256') == 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD':
+        if headers.get(CONTENT_SHA256_HEADER) == STREAMING_HMAC_PAYLOAD:
             modified_data = strip_chunk_signatures(modified_data or data)
             headers['content-length'] = headers.get('x-amz-decoded-content-length')
 
@@ -705,9 +814,6 @@ class ProxyListenerS3(ProxyListener):
         if method == 'PUT' and not headers.get('content-type'):
             headers['content-type'] = 'binary/octet-stream'
 
-        # persist this API call to disk
-        persistence.record('s3', method, path, data, headers)
-
         # parse query params
         query = parsed_path.query
         path = parsed_path.path
@@ -716,6 +822,9 @@ class ProxyListenerS3(ProxyListener):
 
         # remap metadata query params (not supported in moto) to request headers
         append_metadata_headers(method, query_map, headers)
+
+        # apply fixes
+        headers_changed = fix_metadata_key_underscores(request_headers=headers)
 
         if query == 'notification' or 'notification' in query_map:
             # handle and return response for ?notification request
@@ -754,8 +863,8 @@ class ProxyListenerS3(ProxyListener):
             if method == 'PUT':
                 return set_object_lock(bucket, data)
 
-        if modified_data is not None:
-            return Request(data=modified_data, headers=headers, method=method)
+        if modified_data is not None or headers_changed:
+            return Request(data=modified_data or data, headers=headers, method=method)
         return True
 
     def get_201_reponse(self, key, bucket_name):
@@ -784,8 +893,7 @@ class ProxyListenerS3(ProxyListener):
         path_new = re.sub(r'/([^?/]+)([?/].*)?', sub, path)
         if path == path_new:
             return
-        url = '%s://%s:%s%s' % (get_service_protocol(), constants.LOCALHOST,
-            constants.DEFAULT_PORT_S3_BACKEND, path_new)
+        url = 'http://%s:%s%s' % (constants.LOCALHOST, constants.DEFAULT_PORT_S3_BACKEND, path_new)
         return url
 
     def return_response(self, method, path, data, headers, response):
@@ -793,6 +901,9 @@ class ProxyListenerS3(ProxyListener):
         path = to_str(path)
         method = to_str(method)
         bucket_name = get_bucket_name(path, headers)
+
+        # persist this API call to disk
+        persistence.record('s3', method, path, data, headers, response=response)
 
         # No path-name based bucket name? Try host-based
         hostname_parts = headers['host'].split('.')
@@ -816,6 +927,8 @@ class ProxyListenerS3(ProxyListener):
             if response.status_code == 200 and status_code == '201' and key:
                 response.status_code = 201
                 response._content = self.get_201_reponse(key, bucket_name)
+                response.headers['Content-Length'] = str(len(response._content))
+                response.headers['Content-Type'] = 'application/xml; charset=utf-8'
                 return response
 
         parsed = urlparse.urlparse(path)
@@ -823,10 +936,10 @@ class ProxyListenerS3(ProxyListener):
 
         should_send_notifications = all([
             method in ('PUT', 'POST', 'DELETE'),
-            '/' in path[1:] or bucket_name_in_host,
+            '/' in path[1:] or bucket_name_in_host or key,
             # check if this is an actual put object request, because it could also be
             # a put bucket request with a path like this: /bucket_name/
-            bucket_name_in_host or (len(path[1:].split('/')) > 1 and len(path[1:].split('/')[1]) > 0),
+            bucket_name_in_host or key or (len(path[1:].split('/')) > 1 and len(path[1:].split('/')[1]) > 0),
             self.is_query_allowable(method, parsed.query)
         ])
 
@@ -884,6 +997,11 @@ class ProxyListenerS3(ProxyListener):
             append_last_modified_headers(response=response)
             append_list_objects_marker(method, path, data, response)
             fix_location_constraint(response)
+            fix_range_content_type(bucket_name, path, headers, response)
+            fix_delete_objects_response(bucket_name, method, parsed, data, headers, response)
+            fix_metadata_key_underscores(response=response)
+            fix_creation_date(method, path, response=response)
+            fix_etag_for_multipart(data, headers, response)
 
             # Remove body from PUT response on presigned URL
             # https://github.com/localstack/localstack/issues/1317

@@ -4,6 +4,11 @@ import logging
 import traceback
 from moto.s3 import models as s3_models
 from moto.s3 import responses as s3_responses
+from moto.s3.responses import (
+    minidom,
+    MalformedXML,
+    undo_clean_key_name
+)
 from moto.server import main as moto_main
 from localstack import config
 from localstack.constants import DEFAULT_PORT_S3_BACKEND
@@ -76,6 +81,8 @@ def apply_patches():
         if acl:
             key.set_acl(acl)
 
+    # patch _key_response_post(..)
+
     def s3_key_response_post(self, request, body, bucket_name, query, key_name, *args, **kwargs):
         result = s3_key_response_post_orig(request, body, bucket_name, query, key_name, *args, **kwargs)
         s3_update_acls(self, request, query, bucket_name, key_name)
@@ -85,6 +92,8 @@ def apply_patches():
     s3_responses.S3ResponseInstance._key_response_post = types.MethodType(
         s3_key_response_post, s3_responses.S3ResponseInstance)
 
+    # patch _key_response_put(..)
+
     def s3_key_response_put(self, request, body, bucket_name, query, key_name, headers, *args, **kwargs):
         result = s3_key_response_put_orig(request, body, bucket_name, query, key_name, headers, *args, **kwargs)
         s3_update_acls(self, request, query, bucket_name, key_name)
@@ -93,6 +102,98 @@ def apply_patches():
     s3_key_response_put_orig = s3_responses.S3ResponseInstance._key_response_put
     s3_responses.S3ResponseInstance._key_response_put = types.MethodType(
         s3_key_response_put, s3_responses.S3ResponseInstance)
+
+    # patch DeleteObjectTagging
+
+    def s3_key_response_delete(self, bucket_name, query, key_name, *args, **kwargs):
+        # Fixes https://github.com/localstack/localstack/issues/1083
+        if query.get('tagging'):
+            self._set_action('KEY', 'DELETE', query)
+            self._authenticate_and_authorize_s3_action()
+            key = self.backend.get_key(bucket_name, key_name)
+            key.tags = s3_models.FakeTagging()
+            return 204, {}, ''
+        result = s3_key_response_delete_orig(bucket_name, query, key_name, *args, **kwargs)
+        return result
+
+    s3_key_response_delete_orig = s3_responses.S3ResponseInstance._key_response_delete
+    s3_responses.S3ResponseInstance._key_response_delete = types.MethodType(
+        s3_key_response_delete, s3_responses.S3ResponseInstance)
+    s3_responses.ACTION_MAP['KEY']['DELETE']['tagging'] = 'DeleteObjectTagging'
+
+    # patch max-keys
+
+    def s3_truncate_result(self, result_keys, max_keys):
+        return s3_truncate_result_orig(result_keys, max_keys or 1000)
+
+    s3_truncate_result_orig = s3_responses.S3ResponseInstance._truncate_result
+    s3_responses.S3ResponseInstance._truncate_result = types.MethodType(
+        s3_truncate_result, s3_responses.S3ResponseInstance)
+
+    # patch _bucket_response_delete_keys(..)
+    # https://github.com/localstack/localstack/issues/2077
+
+    s3_delete_keys_response_template = """<?xml version="1.0" encoding="UTF-8"?>
+    <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01">
+    {% for k in deleted %}
+    <Deleted>
+    <Key>{{k.key}}</Key>
+    <VersionId>{{k.version_id}}</VersionId>
+    </Deleted>
+    {% endfor %}
+    {% for k in delete_errors %}
+    <Error>
+    <Key>{{k}}</Key>
+    </Error>
+    {% endfor %}
+    </DeleteResult>"""
+
+    def s3_bucket_response_delete_keys(self, request, body, bucket_name):
+        template = self.response_template(s3_delete_keys_response_template)
+
+        elements = minidom.parseString(body).getElementsByTagName('Object')
+        if len(elements) == 0:
+            raise MalformedXML()
+
+        deleted_names = []
+        error_names = []
+
+        keys = []
+        for element in elements:
+            if len(element.getElementsByTagName('VersionId')) == 0:
+                version_id = None
+            else:
+                version_id = element.getElementsByTagName('VersionId')[0].firstChild.nodeValue
+
+            keys.append({
+                'key_name': element.getElementsByTagName('Key')[0].firstChild.nodeValue,
+                'version_id': version_id
+            })
+
+        for k in keys:
+            key_name = k['key_name']
+            version_id = k['version_id']
+            success = self.backend.delete_key(
+                bucket_name, undo_clean_key_name(key_name), version_id
+            )
+
+            if success:
+                deleted_names.append({
+                    'key': key_name,
+                    'version_id': version_id
+                })
+            else:
+                error_names.append(key_name)
+
+        return (
+            200,
+            {},
+            template.render(deleted=deleted_names, delete_errors=error_names),
+        )
+
+    s3_responses.S3ResponseInstance._bucket_response_delete_keys = types.MethodType(
+        s3_bucket_response_delete_keys, s3_responses.S3ResponseInstance
+    )
 
 
 def main():
